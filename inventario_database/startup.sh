@@ -6,6 +6,9 @@ DB_USER="appuser"
 DB_PASSWORD="dbuser123"
 DB_PORT="5000"
 
+SCHEMA_FILE="schema.sql"
+APPLIED_MARKER=".schema_applied.marker"
+
 echo "Starting PostgreSQL setup..."
 
 # Find PostgreSQL version and set paths
@@ -13,6 +16,31 @@ PG_VERSION=$(ls /usr/lib/postgresql/ | head -1)
 PG_BIN="/usr/lib/postgresql/${PG_VERSION}/bin"
 
 echo "Found PostgreSQL version: ${PG_VERSION}"
+
+# Helper to apply schema if available (idempotent)
+apply_schema() {
+    if [ ! -f "${SCHEMA_FILE}" ]; then
+        echo "No ${SCHEMA_FILE} found, skipping schema application."
+        return 0
+    fi
+
+    # Apply schema idempotently:
+    # - We use CREATE IF NOT EXISTS and CREATE OR REPLACE in schema.sql.
+    # - We also gate with a marker to avoid re-running unnecessarily.
+    if [ -f "${APPLIED_MARKER}" ]; then
+        echo "Schema already applied previously (${APPLIED_MARKER} present)."
+        return 0
+    fi
+
+    echo "Applying database schema from ${SCHEMA_FILE}..."
+    if sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -f "${SCHEMA_FILE}" > /tmp/schema_apply.log 2>&1; then
+        echo "✓ Schema applied successfully."
+        date > "${APPLIED_MARKER}"
+    else
+        echo "⚠ Failed to apply schema. See /tmp/schema_apply.log for details."
+        # Do not exit; continue startup so DB is available.
+    fi
+}
 
 # Check if PostgreSQL is already running on the specified port
 if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
@@ -28,7 +56,13 @@ if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
     if [ -f "db_connection.txt" ]; then
         echo "Or use: $(cat db_connection.txt)"
     fi
-    
+
+    # Ensure database exists and apply schema if needed
+    sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1 || \
+        sudo -u postgres ${PG_BIN}/createdb -p ${DB_PORT} ${DB_NAME} 2>/dev/null || true
+
+    apply_schema
+
     echo ""
     echo "Script stopped - server already running."
     exit 0
@@ -42,6 +76,9 @@ if pgrep -f "postgres.*-p ${DB_PORT}" > /dev/null 2>&1; then
     # Try to connect and verify the database exists
     if sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -c '\q' 2>/dev/null; then
         echo "Database ${DB_NAME} is accessible."
+
+        apply_schema
+
         echo "Script stopped - server already running."
         exit 0
     fi
@@ -106,10 +143,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TYPES TO ${DB_USER};
 
--- If you want the user to be able to create objects without restrictions,
--- you can make them the owner of the public schema (optional but effective)
--- ALTER SCHEMA public OWNER TO ${DB_USER};
-
 -- Alternative: Grant all privileges on schema public to the user
 GRANT ALL ON SCHEMA public TO ${DB_USER};
 
@@ -128,6 +161,9 @@ GRANT CREATE ON SCHEMA public TO ${DB_USER};
 -- Show current permissions for debugging
 \dn+ public
 EOF
+
+# Apply schema (idempotent)
+apply_schema
 
 # Save connection command to a file
 echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@localhost:${DB_PORT}/${DB_NAME}" > db_connection.txt
